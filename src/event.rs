@@ -1,3 +1,4 @@
+use crate::liquidity::LiquiditySource;
 use crate::types::{DynStore, Sweeper, Wallet};
 use crate::{
 	hex_utils, ChannelManager, Config, Error, NetworkGraph, PeerInfo, PeerStore, UserChannelId,
@@ -11,7 +12,7 @@ use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
 };
-use crate::logger::{log_error, log_info, Logger};
+use crate::logger::{log_error, log_info, FilesystemLogger, Logger};
 
 use lightning::chain::chaininterface::ConfirmationTarget;
 use lightning::events::{ClosureReason, PaymentPurpose};
@@ -303,6 +304,7 @@ where
 	payment_store: Arc<PaymentStore<L>>,
 	peer_store: Arc<PeerStore<L>>,
 	runtime: Arc<RwLock<Option<tokio::runtime::Runtime>>>,
+	liquidity_source: Option<Arc<LiquiditySource<Arc<FilesystemLogger>>>>,
 	logger: L,
 	config: Arc<Config>,
 }
@@ -316,6 +318,7 @@ where
 		output_sweeper: Arc<Sweeper>, network_graph: Arc<NetworkGraph>,
 		payment_store: Arc<PaymentStore<L>>, peer_store: Arc<PeerStore<L>>,
 		runtime: Arc<RwLock<Option<tokio::runtime::Runtime>>>, logger: L, config: Arc<Config>,
+		liquidity_source: Option<Arc<LiquiditySource<Arc<FilesystemLogger>>>>,
 	) -> Self {
 		Self {
 			event_queue,
@@ -328,6 +331,7 @@ where
 			logger,
 			runtime,
 			config,
+			liquidity_source,
 		}
 	}
 
@@ -688,7 +692,11 @@ where
 			LdkEvent::PaymentPathFailed { .. } => {},
 			LdkEvent::ProbeSuccessful { .. } => {},
 			LdkEvent::ProbeFailed { .. } => {},
-			LdkEvent::HTLCHandlingFailed { .. } => {},
+			LdkEvent::HTLCHandlingFailed { failed_next_destination, .. } => {
+				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+					liquidity_source.htlc_handling_failed(failed_next_destination);
+				}
+			},
 			LdkEvent::PendingHTLCsForwardable { time_forwardable } => {
 				let forwarding_channel_manager = self.channel_manager.clone();
 				let min = time_forwardable.as_millis() as u64;
@@ -767,6 +775,10 @@ where
 				outbound_amount_forwarded_msat,
 				..
 			} => {
+				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+					liquidity_source.payment_forwarded(next_channel_id);
+				}
+
 				let read_only_network_graph = self.network_graph.read_only();
 				let nodes = read_only_network_graph.nodes();
 				let channels = self.channel_manager.list_channels();
@@ -887,6 +899,15 @@ where
 					channel_id,
 					counterparty_node_id,
 				);
+
+				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+					liquidity_source.channel_ready(
+						user_channel_id,
+						&channel_id,
+						&counterparty_node_id,
+					);
+				}
+
 				self.event_queue
 					.add_event(Event::ChannelReady {
 						channel_id,
@@ -919,7 +940,22 @@ where
 					});
 			},
 			LdkEvent::DiscardFunding { .. } => {},
-			LdkEvent::HTLCIntercepted { .. } => {},
+			LdkEvent::HTLCIntercepted {
+				requested_next_hop_scid,
+				intercept_id,
+				expected_outbound_amount_msat,
+				payment_hash,
+				..
+			} => {
+				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+					liquidity_source.htlc_intercepted(
+						requested_next_hop_scid,
+						intercept_id,
+						expected_outbound_amount_msat,
+						payment_hash,
+					);
+				}
+			},
 			LdkEvent::BumpTransaction(_) => {},
 			LdkEvent::InvoiceRequestFailed { .. } => {},
 			LdkEvent::ConnectionNeeded { .. } => {},

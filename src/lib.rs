@@ -90,6 +90,7 @@ mod logger;
 mod message_handler;
 mod payment_store;
 mod peer_store;
+mod routing_message_handler;
 mod sweep;
 mod tx_broadcaster;
 mod types;
@@ -101,6 +102,7 @@ pub use bip39;
 pub use bitcoin;
 pub use lightning;
 pub use lightning_invoice;
+pub use lightning_persister;
 
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
 pub use config::{default_config, Config};
@@ -637,6 +639,7 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
+			self.liquidity_source.clone(),
 		));
 
 		// Setup background processing
@@ -695,6 +698,7 @@ impl Node {
 							return;
 						}
 						_ = liquidity_handler.handle_next_event() => {}
+						_ = liquidity_handler.handle_next_peer_connected_event() => {}
 					}
 				}
 			});
@@ -1155,7 +1159,7 @@ impl Node {
 				Ok(payment_hash)
 			},
 			Err(e) => {
-				log_error!(self.logger, "Failed to send payment: {:?}", e);
+				println!("Failed to send payment: {:?}", e);
 				match e {
 					channelmanager::RetryableSendFailure::DuplicatePayment => {
 						Err(Error::DuplicatePayment)

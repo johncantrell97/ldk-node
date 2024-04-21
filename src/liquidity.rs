@@ -2,14 +2,17 @@ use crate::logger::{log_debug, log_error, log_info, Logger};
 use crate::types::{ChannelManager, KeysManager, LiquidityManager, PeerManager};
 use crate::{Config, Error};
 
-use lightning::ln::channelmanager::MIN_FINAL_CLTV_EXPIRY_DELTA;
+use chrono::{DateTime, Utc};
+use lightning::events::HTLCDestination;
+use lightning::ln::channelmanager::{InterceptId, MIN_FINAL_CLTV_EXPIRY_DELTA};
 use lightning::ln::msgs::SocketAddress;
+use lightning::ln::{ChannelId, PaymentHash};
 use lightning::routing::router::{RouteHint, RouteHintHop};
 use lightning_invoice::{Bolt11Invoice, InvoiceBuilder, RoutingFees};
 use lightning_liquidity::events::Event;
 use lightning_liquidity::lsps0::ser::RequestId;
-use lightning_liquidity::lsps2::event::LSPS2ClientEvent;
-use lightning_liquidity::lsps2::msgs::OpeningFeeParams;
+use lightning_liquidity::lsps2::event::{LSPS2ClientEvent, LSPS2ServiceEvent};
+use lightning_liquidity::lsps2::msgs::{OpeningFeeParams, RawOpeningFeeParams};
 use lightning_liquidity::lsps2::utils::compute_opening_fee;
 
 use bitcoin::hashes::{sha256, Hash};
@@ -21,8 +24,15 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::broadcast::{Receiver, Sender};
 
 const LIQUIDITY_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChannelOpenRequest {
+	amt_to_forward_msat: u64,
+	user_channel_id: u128,
+}
 
 struct LSPS2Service {
 	address: SocketAddress,
@@ -32,16 +42,24 @@ struct LSPS2Service {
 	pending_buy_requests: Mutex<HashMap<RequestId, oneshot::Sender<LSPS2BuyResponse>>>,
 }
 
+struct LSPS2Client {
+	pending_channel_open_requests: Mutex<HashMap<PublicKey, Vec<ChannelOpenRequest>>>,
+}
+
 pub(crate) struct LiquiditySource<L: Deref>
 where
 	L::Target: Logger,
 {
 	lsps2_service: Option<LSPS2Service>,
+	lsps2_client: Option<LSPS2Client>,
 	channel_manager: Arc<ChannelManager>,
 	keys_manager: Arc<KeysManager>,
 	liquidity_manager: Arc<LiquidityManager>,
 	config: Arc<Config>,
 	logger: L,
+	peer_manager: Mutex<Option<Arc<PeerManager>>>,
+	peer_connected_sender: Option<Sender<PublicKey>>,
+	peer_connected_receiver: Option<tokio::sync::Mutex<Receiver<PublicKey>>>,
 }
 
 impl<L: Deref> LiquiditySource<L>
@@ -55,6 +73,8 @@ where
 	) -> Self {
 		let pending_fee_requests = Mutex::new(HashMap::new());
 		let pending_buy_requests = Mutex::new(HashMap::new());
+		let peer_manager = Mutex::new(None);
+
 		let lsps2_service = Some(LSPS2Service {
 			address,
 			node_id,
@@ -62,10 +82,115 @@ where
 			pending_fee_requests,
 			pending_buy_requests,
 		});
-		Self { lsps2_service, channel_manager, keys_manager, liquidity_manager, config, logger }
+		Self {
+			lsps2_service,
+			lsps2_client: None,
+			channel_manager,
+			keys_manager,
+			liquidity_manager,
+			config,
+			logger,
+			peer_manager,
+			peer_connected_sender: None,
+			peer_connected_receiver: None,
+		}
+	}
+
+	pub(crate) fn new_lsps2_provider(
+		channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
+		liquidity_manager: Arc<LiquidityManager>, config: Arc<Config>, logger: L,
+	) -> Self {
+		let (sender, receiver) = tokio::sync::broadcast::channel::<PublicKey>(1000);
+		Self {
+			lsps2_service: None,
+			lsps2_client: Some(LSPS2Client {
+				pending_channel_open_requests: Mutex::new(HashMap::new()),
+			}),
+			channel_manager,
+			keys_manager,
+			liquidity_manager,
+			config,
+			logger,
+			peer_manager: Mutex::new(None),
+			peer_connected_sender: Some(sender),
+			peer_connected_receiver: Some(tokio::sync::Mutex::new(receiver)),
+		}
+	}
+
+	pub(crate) fn peer_connected(&self, their_node_id: &PublicKey) {
+		if let Some(sender) = self.peer_connected_sender.as_ref() {
+			if let Err(e) = sender.send(their_node_id.clone()) {
+				log_error!(self.logger, "Failed to send peer connected event: {:?}", e);
+			}
+		}
+	}
+
+	pub(crate) fn handle_peer_connected(&self, their_node_id: &PublicKey) {
+		if let Some(lsps2_client) = self.lsps2_client.as_ref() {
+			if let Some(pending_requests) =
+				lsps2_client.pending_channel_open_requests.lock().unwrap().remove(their_node_id)
+			{
+				for request in pending_requests {
+					self.handle_channel_open_request(*their_node_id, request);
+				}
+			}
+		}
+	}
+
+	pub(crate) fn channel_ready(
+		&self, user_channel_id: u128, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
+	) {
+		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
+			if let Err(e) = lsps2_service_handler.channel_ready(
+				user_channel_id,
+				channel_id,
+				counterparty_node_id,
+			) {
+				log_error!(self.logger, "Errored processing htlc handling failed event: {:?}", e);
+			}
+		}
+	}
+
+	pub(crate) fn htlc_intercepted(
+		&self, intercept_scid: u64, intercept_id: InterceptId, expected_outbound_amount_msat: u64,
+		payment_hash: PaymentHash,
+	) {
+		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
+			if let Err(e) = lsps2_service_handler.htlc_intercepted(
+				intercept_scid,
+				intercept_id,
+				expected_outbound_amount_msat,
+				payment_hash,
+			) {
+				log_error!(self.logger, "Failed to handle intercepted HTLC: {:?}", e);
+			}
+		}
+	}
+
+	pub(crate) fn htlc_handling_failed(&self, failed_next_destination: HTLCDestination) {
+		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
+			if let Err(e) = lsps2_service_handler.htlc_handling_failed(failed_next_destination) {
+				log_error!(self.logger, "Errored processing htlc handling failed event: {:?}", e);
+			}
+		}
+	}
+
+	pub(crate) fn payment_forwarded(&self, next_channel_id: Option<ChannelId>) {
+		if let Some(next_channel_id) = next_channel_id {
+			if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
+				if let Err(e) = lsps2_service_handler.payment_forwarded(next_channel_id) {
+					log_error!(self.logger, "Failed to handle payment forwarded: {:?}", e);
+				}
+			}
+		}
 	}
 
 	pub(crate) fn set_peer_manager(&self, peer_manager: Arc<PeerManager>) {
+		{
+			let mut peer_manager_guard = self.peer_manager.lock().unwrap();
+			*peer_manager_guard = Some(peer_manager.clone());
+		}
+
 		let process_msgs_callback = move || peer_manager.process_events();
 		self.liquidity_manager.set_process_msgs_callback(process_msgs_callback);
 	}
@@ -78,8 +203,153 @@ where
 		self.lsps2_service.as_ref().map(|s| (s.node_id, s.address.clone()))
 	}
 
+	pub(crate) fn handle_channel_open_request(
+		&self, their_network_key: PublicKey, request: ChannelOpenRequest,
+	) {
+		let channel_size_sats = (request.amt_to_forward_msat / 1000) * 4;
+		let mut config = *self.channel_manager.get_current_default_configuration();
+		config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+		config.channel_config.forwarding_fee_base_msat = 0;
+		config.channel_config.forwarding_fee_proportional_millionths = 0;
+
+		if let Err(e) = self.channel_manager.create_channel(
+			their_network_key,
+			channel_size_sats,
+			0,
+			request.user_channel_id,
+			None,
+			Some(config),
+		) {
+			log_error!(self.logger, "Failed to open jit channel: {:?}", e);
+		}
+	}
+
+	pub(crate) async fn handle_next_peer_connected_event(&self) {
+		if let Some(peer_connected_receiver) = &self.peer_connected_receiver {
+			let mut peer_connected_receiver = peer_connected_receiver.lock().await;
+			if let Ok(peer_connected) = peer_connected_receiver.recv().await {
+				self.handle_peer_connected(&peer_connected);
+			}
+		}
+	}
+
 	pub(crate) async fn handle_next_event(&self) {
 		match self.liquidity_manager.next_event_async().await {
+			Event::LSPS2Service(LSPS2ServiceEvent::GetInfo {
+				request_id,
+				counterparty_node_id,
+				token: _,
+			}) => {
+				let service_handler = self.liquidity_manager.lsps2_service_handler().unwrap();
+
+				let min_fee_msat = 0;
+				let proportional = 0;
+				let mut valid_until: DateTime<Utc> = Utc::now();
+				valid_until += chrono::Duration::minutes(10);
+				let min_lifetime = 1008;
+				let max_client_to_self_delay = 144;
+				let min_payment_size_msat = 1000;
+				let max_payment_size_msat = 10_000_000_000;
+
+				let opening_fee_params = RawOpeningFeeParams {
+					min_fee_msat,
+					proportional,
+					valid_until,
+					min_lifetime,
+					max_client_to_self_delay,
+					min_payment_size_msat,
+					max_payment_size_msat,
+				};
+
+				let opening_fee_params_menu = vec![opening_fee_params];
+
+				if let Err(e) = service_handler.opening_fee_params_generated(
+					&counterparty_node_id,
+					request_id,
+					opening_fee_params_menu,
+				) {
+					log_error!(
+						self.logger,
+						"Failed to handle generated opening fee params: {:?}",
+						e
+					);
+				}
+			},
+			Event::LSPS2Service(LSPS2ServiceEvent::BuyRequest {
+				request_id,
+				counterparty_node_id,
+				opening_fee_params: _,
+				payment_size_msat: _,
+			}) => {
+				let user_channel_id = 0;
+				let scid = self.channel_manager.get_intercept_scid();
+				let cltv_expiry_delta = 72;
+				let client_trusts_lsp = true;
+
+				let lsps2_service_handler = self
+					.liquidity_manager
+					.lsps2_service_handler()
+					.expect("to be configured with lsps2 service config");
+
+				if let Err(e) = lsps2_service_handler.invoice_parameters_generated(
+					&counterparty_node_id,
+					request_id,
+					scid,
+					cltv_expiry_delta,
+					client_trusts_lsp,
+					user_channel_id,
+				) {
+					log_error!(self.logger, "Failed to provide invoice parameters: {:?}", e);
+				}
+			},
+			Event::LSPS2Service(LSPS2ServiceEvent::OpenChannel {
+				their_network_key,
+				amt_to_forward_msat,
+				opening_fee_msat: _,
+				user_channel_id,
+				intercept_scid: _,
+			}) => {
+				let open_channel_request =
+					ChannelOpenRequest { amt_to_forward_msat, user_channel_id };
+
+				let connected_to_peer = self
+					.peer_manager
+					.lock()
+					.unwrap()
+					.as_ref()
+					.map(|peer_manager| peer_manager.peer_by_node_id(&their_network_key))
+					.flatten()
+					.is_some();
+
+				if !connected_to_peer {
+					if let Some(lsps2_client) = self.lsps2_client.as_ref() {
+						let mut pending_channel_open_requests =
+							lsps2_client.pending_channel_open_requests.lock().unwrap();
+
+						pending_channel_open_requests
+							.entry(their_network_key)
+							.and_modify(|requests| requests.push(open_channel_request.clone()))
+							.or_insert(vec![open_channel_request]);
+
+						if let Some(lsps5_service) =
+							self.liquidity_manager().lsps5_service_handler()
+						{
+							if let Err(e) =
+								lsps5_service.send_payment_incoming_notification(&their_network_key)
+							{
+								log_error!(
+									self.logger,
+									"Failed to send payment incoming notification: {:?}",
+									e
+								);
+							}
+						}
+						return;
+					}
+				}
+
+				self.handle_channel_open_request(their_network_key, open_channel_request);
+			},
 			Event::LSPS2Client(LSPS2ClientEvent::OpeningParametersReady {
 				request_id,
 				counterparty_node_id,

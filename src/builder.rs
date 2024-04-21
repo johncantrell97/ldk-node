@@ -13,6 +13,7 @@ use crate::logger::{log_error, log_info, FilesystemLogger, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment_store::PaymentStore;
 use crate::peer_store::PeerStore;
+use crate::routing_message_handler::PeerConnectedNotifier;
 use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
 	ChainMonitor, ChannelManager, DynStore, GossipSync, KeysManager, MessageRouter, NetworkGraph,
@@ -39,12 +40,15 @@ use lightning::util::persist::{
 use lightning::util::ser::ReadableArgs;
 use lightning::util::sweep::OutputSweeper;
 
+use lightning_liquidity::lsps2::service::LSPS2ServiceConfig;
+use lightning_liquidity::lsps5::client::LSPS5ClientConfig;
+use lightning_liquidity::lsps5::service::LSPS5ServiceConfig;
 use lightning_persister::fs_store::FilesystemStore;
 
 use lightning_transaction_sync::EsploraSyncClient;
 
 use lightning_liquidity::lsps2::client::LSPS2ClientConfig;
-use lightning_liquidity::{LiquidityClientConfig, LiquidityManager};
+use lightning_liquidity::{LiquidityClientConfig, LiquidityManager, LiquidityServiceConfig};
 
 #[cfg(any(vss, vss_test))]
 use crate::io::vss_store::VssStore;
@@ -173,6 +177,7 @@ pub struct NodeBuilder {
 	chain_data_source_config: Option<ChainDataSourceConfig>,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
+	liquidity_provider: bool,
 }
 
 impl NodeBuilder {
@@ -194,6 +199,7 @@ impl NodeBuilder {
 			chain_data_source_config,
 			gossip_source_config,
 			liquidity_source_config,
+			liquidity_provider: false,
 		}
 	}
 
@@ -264,6 +270,12 @@ impl NodeBuilder {
 		let liquidity_source_config =
 			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
 		liquidity_source_config.lsps2_service = Some((address, node_id, token));
+		self
+	}
+
+	/// Configures the [`Node`] instance to act as a liquidity provider.
+	pub fn set_liquidity_provider_lsps2(&mut self) -> &mut Self {
+		self.liquidity_provider = true;
 		self
 	}
 
@@ -390,6 +402,7 @@ impl NodeBuilder {
 			seed_bytes,
 			logger,
 			kv_store,
+			self.liquidity_provider,
 		)
 	}
 }
@@ -523,7 +536,7 @@ fn build_with_store_internal(
 	config: Arc<Config>, chain_data_source_config: Option<&ChainDataSourceConfig>,
 	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>, seed_bytes: [u8; 64],
-	logger: Arc<FilesystemLogger>, kv_store: Arc<DynStore>,
+	logger: Arc<FilesystemLogger>, kv_store: Arc<DynStore>, liquidity_provider: bool,
 ) -> Result<Node, BuildError> {
 	// Initialize the on-chain wallet and chain access
 	let xprv = bitcoin::bip32::ExtendedPrivKey::new_master(config.network.into(), &seed_bytes)
@@ -712,6 +725,10 @@ fn build_with_store_internal(
 			100;
 	}
 
+	if liquidity_provider {
+		user_config.accept_intercept_htlcs = true;
+	}
+
 	// Initialize the ChannelManager
 	let channel_manager = {
 		if let Ok(res) = kv_store.read(
@@ -826,10 +843,12 @@ fn build_with_store_internal(
 		},
 	};
 
-	let liquidity_source = liquidity_source_config.as_ref().and_then(|lsc| {
+	let mut liquidity_source = liquidity_source_config.as_ref().and_then(|lsc| {
 		lsc.lsps2_service.as_ref().map(|(address, node_id, token)| {
 			let lsps2_client_config = Some(LSPS2ClientConfig {});
-			let liquidity_client_config = Some(LiquidityClientConfig { lsps2_client_config });
+			let lsps5_client_config = Some(LSPS5ClientConfig {});
+			let liquidity_client_config =
+				Some(LiquidityClientConfig { lsps2_client_config, lsps5_client_config });
 			let liquidity_manager = Arc::new(LiquidityManager::new(
 				Arc::clone(&keys_manager),
 				Arc::clone(&channel_manager),
@@ -837,6 +856,7 @@ fn build_with_store_internal(
 				None,
 				None,
 				liquidity_client_config,
+				Some(Arc::clone(&kv_store)),
 			));
 			Arc::new(LiquiditySource::new_lsps2(
 				address.clone(),
@@ -851,6 +871,32 @@ fn build_with_store_internal(
 		})
 	});
 
+	if liquidity_provider {
+		let liquidity_manager = Arc::new(LiquidityManager::new(
+			Arc::clone(&keys_manager),
+			Arc::clone(&channel_manager),
+			Some(Arc::clone(&tx_sync)),
+			None,
+			Some(LiquidityServiceConfig {
+				lsps2_service_config: Some(LSPS2ServiceConfig { promise_secret: [0; 32] }),
+				lsps5_service_config: Some(LSPS5ServiceConfig {
+					max_webhooks: 5,
+					supported_protocols: vec!["http".to_string()],
+				}),
+				advertise_service: true,
+			}),
+			None,
+			Some(Arc::clone(&kv_store)),
+		));
+		liquidity_source = Some(Arc::new(LiquiditySource::new_lsps2_provider(
+			Arc::clone(&channel_manager),
+			Arc::clone(&keys_manager),
+			liquidity_manager,
+			Arc::clone(&config),
+			Arc::clone(&logger),
+		)));
+	}
+
 	let custom_message_handler = if let Some(liquidity_source) = liquidity_source.as_ref() {
 		Arc::new(NodeCustomMessageHandler::new_liquidity(Arc::clone(&liquidity_source)))
 	} else {
@@ -860,15 +906,19 @@ fn build_with_store_internal(
 	let msg_handler = match gossip_source.as_gossip_sync() {
 		GossipSync::P2P(p2p_gossip_sync) => MessageHandler {
 			chan_handler: Arc::clone(&channel_manager),
-			route_handler: Arc::clone(&p2p_gossip_sync)
-				as Arc<dyn RoutingMessageHandler + Sync + Send>,
+			route_handler: Arc::new(PeerConnectedNotifier::new(
+				p2p_gossip_sync.clone() as Arc<dyn RoutingMessageHandler + Send + Sync>,
+				liquidity_source.clone(),
+			)),
 			onion_message_handler: onion_messenger,
 			custom_message_handler,
 		},
 		GossipSync::Rapid(_) => MessageHandler {
 			chan_handler: Arc::clone(&channel_manager),
-			route_handler: Arc::new(IgnoringMessageHandler {})
-				as Arc<dyn RoutingMessageHandler + Sync + Send>,
+			route_handler: Arc::new(PeerConnectedNotifier::new(
+				Arc::new(IgnoringMessageHandler {}) as Arc<dyn RoutingMessageHandler + Send + Sync>,
+				liquidity_source.clone(),
+			)),
 			onion_message_handler: onion_messenger,
 			custom_message_handler,
 		},

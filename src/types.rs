@@ -1,5 +1,6 @@
 use crate::logger::FilesystemLogger;
 use crate::message_handler::NodeCustomMessageHandler;
+use crate::routing_message_handler::PeerConnectedNotifier;
 
 use lightning::chain::chainmonitor;
 use lightning::ln::channelmanager::ChannelDetails as LdkChannelDetails;
@@ -38,7 +39,7 @@ pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
 pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 	SocketDescriptor,
 	Arc<ChannelManager>,
-	Arc<dyn RoutingMessageHandler + Send + Sync>,
+	Arc<PeerConnectedNotifier<Arc<dyn RoutingMessageHandler + Send + Sync>, Arc<FilesystemLogger>>>,
 	Arc<OnionMessenger>,
 	Arc<FilesystemLogger>,
 	Arc<NodeCustomMessageHandler<Arc<FilesystemLogger>>>,
@@ -47,8 +48,12 @@ pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 
 pub(crate) type ChainSource = EsploraSyncClient<Arc<FilesystemLogger>>;
 
-pub(crate) type LiquidityManager =
-	lightning_liquidity::LiquidityManager<Arc<KeysManager>, Arc<ChannelManager>, Arc<ChainSource>>;
+pub(crate) type LiquidityManager = lightning_liquidity::LiquidityManager<
+	Arc<KeysManager>,
+	Arc<ChannelManager>,
+	Arc<ChainSource>,
+	Arc<DynStore>,
+>;
 
 pub(crate) type ChannelManager = lightning::ln::channelmanager::ChannelManager<
 	Arc<ChainMonitor>,
