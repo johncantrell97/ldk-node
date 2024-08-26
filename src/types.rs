@@ -1,9 +1,9 @@
 use crate::logger::FilesystemLogger;
-use crate::message_handler::NodeCustomMessageHandler;
 
+use bitcoin::secp256k1::PublicKey;
+use bitcoin::OutPoint;
 use lightning::chain::chainmonitor;
 use lightning::ln::channelmanager::ChannelDetails as LdkChannelDetails;
-use lightning::ln::msgs::RoutingMessageHandler;
 use lightning::ln::msgs::SocketAddress;
 use lightning::ln::peer_handler::IgnoringMessageHandler;
 use lightning::ln::ChannelId;
@@ -18,11 +18,15 @@ use lightning::util::ser::{Readable, Writeable, Writer};
 use lightning::util::sweep::OutputSweeper;
 use lightning_net_tokio::SocketDescriptor;
 use lightning_transaction_sync::EsploraSyncClient;
-
-use bitcoin::secp256k1::PublicKey;
-use bitcoin::OutPoint;
-
 use std::sync::{Arc, Mutex, RwLock};
+
+#[cfg(feature = "relay")]
+use lightning::ln::peer_handler::ErroringMessageHandler;
+
+#[cfg(not(feature = "relay"))]
+use {
+	crate::message_handler::NodeCustomMessageHandler, lightning::ln::msgs::RoutingMessageHandler,
+};
 
 pub(crate) type DynStore = dyn KVStore + Sync + Send;
 
@@ -35,6 +39,7 @@ pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
 	Arc<DynStore>,
 >;
 
+#[cfg(not(feature = "relay"))]
 pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 	SocketDescriptor,
 	Arc<ChannelManager>,
@@ -42,6 +47,25 @@ pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 	Arc<OnionMessenger>,
 	Arc<FilesystemLogger>,
 	Arc<NodeCustomMessageHandler<Arc<FilesystemLogger>>>,
+	Arc<KeysManager>,
+>;
+
+#[cfg(feature = "relay")]
+pub(crate) type PeerManager = lightning_relay::peer_manager::node::PeerManager<
+	Arc<OnionMessenger>,
+	Arc<KeysManager>,
+	Arc<ChannelManager>,
+	Arc<ChainSource>,
+>;
+
+#[cfg(feature = "relay")]
+pub(crate) type DummyPeerManager = lightning::ln::peer_handler::PeerManager<
+	SocketDescriptor,
+	ErroringMessageHandler,
+	IgnoringMessageHandler,
+	IgnoringMessageHandler,
+	Arc<FilesystemLogger>,
+	IgnoringMessageHandler,
 	Arc<KeysManager>,
 >;
 

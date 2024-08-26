@@ -15,6 +15,9 @@ const DEFAULT_LDK_WALLET_SYNC_INTERVAL_SECS: u64 = 30;
 const DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS: u64 = 60 * 10;
 const DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER: u64 = 3;
 const DEFAULT_LOG_LEVEL: LogLevel = LogLevel::Debug;
+#[cfg(feature = "relay")]
+const DEFAULT_RELAY_NODE_ADDRESS: SocketAddress =
+	SocketAddress::TcpIpV4 { addr: [0, 0, 0, 0], port: 11000 };
 
 // The 'stop gap' parameter used by BDK's wallet sync. This seems to configure the threshold
 // number of derivation indexes after which BDK stops looking for new scripts belonging to the wallet.
@@ -31,6 +34,10 @@ pub(crate) const LDK_PAYMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 
 // The time in-between peer reconnection attempts.
 pub(crate) const PEER_RECONNECTION_INTERVAL: Duration = Duration::from_secs(10);
+
+// The time in-between processing message handler events.
+#[cfg(feature = "relay")]
+pub(crate) const PROCESS_MESSAGE_HANDLER_EVENTS_INTERVAL: Duration = Duration::from_secs(1);
 
 // The time in-between RGS sync attempts.
 pub(crate) const RGS_SYNC_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -104,6 +111,9 @@ pub struct Config {
 	///
 	/// Any messages below this level will be excluded from the logs.
 	pub log_level: LogLevel,
+	#[cfg(feature = "relay")]
+	/// The address the relays will use to communicate with the node.
+	pub relay_node_address: SocketAddress,
 }
 
 impl Default for Config {
@@ -120,6 +130,8 @@ impl Default for Config {
 			trusted_peers_0conf: Vec::new(),
 			probing_liquidity_limit_multiplier: DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER,
 			log_level: DEFAULT_LOG_LEVEL,
+			#[cfg(feature = "relay")]
+			relay_node_address: DEFAULT_RELAY_NODE_ADDRESS,
 		}
 	}
 }
