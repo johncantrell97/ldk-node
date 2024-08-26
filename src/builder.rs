@@ -29,7 +29,9 @@ use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::{
 	ProbabilisticScorer, ProbabilisticScoringDecayParameters, ProbabilisticScoringFeeParameters,
 };
-use lightning::sign::EntropySource;
+
+#[cfg(not(feature = "relay"))]
+use {lightning::sign::EntropySource, std::convert::TryInto};
 
 use lightning::util::config::UserConfig;
 use lightning::util::persist::{
@@ -60,7 +62,6 @@ use bitcoin::{BlockHash, Network};
 
 #[cfg(any(vss, vss_test))]
 use bitcoin::bip32::ChildNumber;
-use std::convert::TryInto;
 use std::default::Default;
 use std::fmt;
 use std::fs;
@@ -294,6 +295,16 @@ impl NodeBuilder {
 		}
 
 		self.config.listening_addresses = Some(listening_addresses);
+		Ok(self)
+	}
+
+	#[cfg(feature = "relay")]
+	/// Sets the IP address and TCP port on which [`Node`] will listen for
+	/// requests from the networking relays.
+	pub fn set_relay_node_address(
+		&mut self, relay_node_address: SocketAddress,
+	) -> Result<&mut Self, BuildError> {
+		self.config.relay_node_address = relay_node_address;
 		Ok(self)
 	}
 
@@ -788,7 +799,6 @@ fn build_with_store_internal(
 		IgnoringMessageHandler {},
 		IgnoringMessageHandler {},
 	));
-	let ephemeral_bytes: [u8; 32] = keys_manager.get_secure_random_bytes();
 
 	// Initialize the GossipSource
 	// Use the configured gossip source, if the user set one, otherwise default to P2PNetwork.
@@ -877,23 +887,36 @@ fn build_with_store_internal(
 		},
 	};
 
-	let cur_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(|e| {
-		log_error!(logger, "Failed to get current time: {}", e);
-		BuildError::InvalidSystemTime
-	})?;
-
+	#[cfg(feature = "relay")]
 	let peer_manager = Arc::new(PeerManager::new(
-		msg_handler,
-		cur_time.as_secs().try_into().map_err(|e| {
-			log_error!(logger, "Failed to get current time: {}", e);
-			BuildError::InvalidSystemTime
-		})?,
-		&ephemeral_bytes,
-		Arc::clone(&logger),
-		Arc::clone(&keys_manager),
+		msg_handler.chan_handler.clone(),
+		msg_handler.route_handler.clone(),
+		msg_handler.onion_message_handler.clone(),
+		liquidity_source.as_ref().map(|ls| ls.liquidity_manager_arc()),
 	));
 
+	#[cfg(not(feature = "relay"))]
+	let peer_manager = {
+		let ephemeral_bytes: [u8; 32] = keys_manager.get_secure_random_bytes();
+		let cur_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(|e| {
+			log_error!(logger, "Failed to get current time: {}", e);
+			BuildError::InvalidSystemTime
+		})?;
+
+		Arc::new(PeerManager::new(
+			msg_handler,
+			cur_time.as_secs().try_into().map_err(|e| {
+				log_error!(logger, "Failed to get current time: {}", e);
+				BuildError::InvalidSystemTime
+			})?,
+			&ephemeral_bytes,
+			Arc::clone(&logger),
+			Arc::clone(&keys_manager),
+		))
+	};
+
 	liquidity_source.as_ref().map(|l| l.set_peer_manager(Arc::clone(&peer_manager)));
+
 
 	let connection_manager =
 		Arc::new(ConnectionManager::new(Arc::clone(&peer_manager), Arc::clone(&logger)));

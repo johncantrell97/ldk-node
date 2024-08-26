@@ -100,6 +100,7 @@ mod wallet;
 pub use bip39;
 pub use bitcoin;
 pub use lightning;
+
 pub use lightning_invoice;
 
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
@@ -165,10 +166,18 @@ use bitcoin::{Address, Txid};
 use rand::Rng;
 
 use std::default::Default;
-use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(feature = "relay")]
+use {
+	crate::config::PROCESS_MESSAGE_HANDLER_EVENTS_INTERVAL, crate::types::DummyPeerManager,
+	lightning::ln::peer_handler::IgnoringMessageHandler,
+};
+
+#[cfg(not(feature = "relay"))]
+use std::net::ToSocketAddrs;
 
 #[cfg(feature = "uniffi")]
 uniffi::include_scaffolding!("ldk_node");
@@ -225,6 +234,9 @@ impl Node {
 		log_info!(self.logger, "Starting up LDK Node on network: {}", self.config.network);
 
 		let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+
+		#[cfg(feature = "relay")]
+		self.peer_manager.set_runtime(runtime.handle().clone());
 
 		// Block to ensure we update our fee rate cache once on startup
 		let fee_estimator = Arc::clone(&self.fee_estimator);
@@ -440,6 +452,7 @@ impl Node {
 			});
 		}
 
+		#[cfg(not(feature = "relay"))]
 		if let Some(listening_addresses) = &self.config.listening_addresses {
 			// Setup networking
 			let peer_manager_connection_handler = Arc::clone(&self.peer_manager);
@@ -500,6 +513,36 @@ impl Node {
 			});
 		}
 
+		#[cfg(feature = "relay")]
+		{
+			let server_pm = Arc::clone(&self.peer_manager);
+			let server_address = self.config.relay_node_address.clone();
+			runtime.spawn(async move {
+				server_pm.start_server(server_address).await;
+			});
+		}
+
+		// Regularly process message handler events.
+		#[cfg(feature = "relay")]
+		{
+			let events_pm = Arc::clone(&self.peer_manager);
+			let mut stop_connect = self.stop_sender.subscribe();
+			runtime.spawn(async move {
+				let mut interval = tokio::time::interval(PROCESS_MESSAGE_HANDLER_EVENTS_INTERVAL);
+				interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+				loop {
+					tokio::select! {
+							_ = stop_connect.changed() => {
+								return;
+							}
+							_ = interval.tick() => {
+								events_pm.process_events_async().await;
+							}
+					}
+				}
+			});
+		}
+
 		// Regularly reconnect to persisted peers.
 		let connect_cm = Arc::clone(&self.connection_manager);
 		let connect_pm = Arc::clone(&self.peer_manager);
@@ -522,7 +565,7 @@ impl Node {
 								.collect::<Vec<_>>();
 
 							for peer_info in connect_peer_store.list_peers().iter().filter(|info| !pm_peers.contains(&info.node_id)) {
-								let res = connect_cm.do_connect_peer(
+								let res = connect_cm.connect_peer(
 									peer_info.node_id,
 									peer_info.address.clone(),
 									).await;
@@ -645,7 +688,19 @@ impl Node {
 		let background_chain_mon = Arc::clone(&self.chain_monitor);
 		let background_chan_man = Arc::clone(&self.channel_manager);
 		let background_gossip_sync = self.gossip_source.as_gossip_sync();
+
+		#[cfg(not(feature = "relay"))]
 		let background_peer_man = Arc::clone(&self.peer_manager);
+
+		#[cfg(feature = "relay")]
+		let background_peer_man = Arc::new(DummyPeerManager::new_routing_only(
+			IgnoringMessageHandler {},
+			0,
+			&[0; 32],
+			Arc::clone(&self.logger),
+			Arc::clone(&self.keys_manager),
+		));
+
 		let background_logger = Arc::clone(&self.logger);
 		let background_error_logger = Arc::clone(&self.logger);
 		let background_scorer = Arc::clone(&self.scorer);
@@ -1757,11 +1812,15 @@ impl Node {
 		for connected_peer in connected_peers {
 			let node_id = connected_peer.counterparty_node_id;
 			let stored_peer = self.peer_store.get_peer(&node_id);
+			lightning::log_debug!(self.logger, " connected to peer {}", node_id.to_string());
 			let stored_addr_opt = stored_peer.as_ref().map(|p| p.address.clone());
 			let address = match (connected_peer.socket_address, stored_addr_opt) {
 				(Some(con_addr), _) => con_addr,
 				(None, Some(stored_addr)) => stored_addr,
-				(None, None) => continue,
+				(None, None) => {
+					lightning::log_debug!(self.logger, "skipping peer because we dont have their address");
+					continue
+				},
 			};
 
 			let is_persisted = stored_peer.is_some();

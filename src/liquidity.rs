@@ -1,5 +1,5 @@
 use crate::logger::{log_debug, log_error, log_info, Logger};
-use crate::types::{ChannelManager, KeysManager, LiquidityManager, PeerManager};
+use crate::types::{ChannelManager, KeysManager, LiquidityManager};
 use crate::{Config, Error};
 
 use lightning::ln::channelmanager::MIN_FINAL_CLTV_EXPIRY_DELTA;
@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::types::PeerManager;
 
 const LIQUIDITY_REQUEST_TIMEOUT_SECS: u64 = 5;
 
@@ -72,6 +74,11 @@ where
 
 	pub(crate) fn liquidity_manager(&self) -> &LiquidityManager {
 		self.liquidity_manager.as_ref()
+	}
+
+	#[cfg(feature = "relay")]
+	pub(crate) fn liquidity_manager_arc(&self) -> Arc<LiquidityManager> {
+		self.liquidity_manager.clone()
 	}
 
 	pub(crate) fn get_liquidity_source_details(&self) -> Option<(PublicKey, SocketAddress)> {

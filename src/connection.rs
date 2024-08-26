@@ -7,9 +7,12 @@ use lightning::ln::msgs::SocketAddress;
 use bitcoin::secp256k1::PublicKey;
 
 use std::collections::hash_map::{self, HashMap};
+use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
+
+#[cfg(not(feature = "relay"))]
 use std::time::Duration;
 
 pub(crate) struct ConnectionManager<L: Deref + Clone + Sync + Send>
@@ -38,10 +41,10 @@ where
 			return Ok(());
 		}
 
-		self.do_connect_peer(node_id, addr).await
+		self.connect_peer(node_id, addr).await
 	}
 
-	pub(crate) async fn do_connect_peer(
+	pub(crate) async fn connect_peer(
 		&self, node_id: PublicKey, addr: SocketAddress,
 	) -> Result<(), Error> {
 		// First, we check if there is already an outbound connection in flight, if so, we just
@@ -72,19 +75,28 @@ where
 				Error::InvalidSocketAddress
 			})?;
 
+		let res = self.do_connect_peer(node_id, socket_addr).await;
+		self.propagate_result_to_subscribers(&node_id, res);
+		res
+	}
+
+	#[cfg(not(feature = "relay"))]
+	async fn do_connect_peer(
+		&self, node_id: PublicKey, socket_addr: SocketAddr,
+	) -> Result<(), Error> {
 		let connection_future = lightning_net_tokio::connect_outbound(
 			Arc::clone(&self.peer_manager),
 			node_id,
 			socket_addr,
 		);
 
-		let res = match connection_future.await {
+		match connection_future.await {
 			Some(connection_closed_future) => {
 				let mut connection_closed_future = Box::pin(connection_closed_future);
 				loop {
 					tokio::select! {
 						_ = &mut connection_closed_future => {
-							log_info!(self.logger, "Peer connection closed: {}@{}", node_id, addr);
+							log_info!(self.logger, "Peer connection closed: {}@{}", node_id, socket_addr);
 							break Err(Error::ConnectionFailed);
 						},
 						_ = tokio::time::sleep(Duration::from_millis(10)) => {},
@@ -97,14 +109,20 @@ where
 				}
 			},
 			None => {
-				log_error!(self.logger, "Failed to connect to peer: {}@{}", node_id, addr);
+				log_error!(self.logger, "Failed to connect to peer: {}@{}", node_id, socket_addr);
 				Err(Error::ConnectionFailed)
 			},
-		};
+		}
+	}
 
-		self.propagate_result_to_subscribers(&node_id, res);
-
-		res
+	#[cfg(feature = "relay")]
+	async fn do_connect_peer(
+		&self, node_id: PublicKey, socket_addr: SocketAddr,
+	) -> Result<(), Error> {
+		self.peer_manager
+			.connect_outbound(node_id, socket_addr)
+			.await
+			.map_err(|()| Error::ConnectionFailed)
 	}
 
 	fn register_or_subscribe_pending_connection(
